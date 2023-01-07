@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::{fmt, mem, ptr};
 
 use crate::common::{validate_int, IntegerOrSdlError};
-use crate::pixels::PixelFormatEnum;
+use crate::pixels::{Color, PixelFormatEnum};
 use crate::rect::Rect;
 use crate::render::CanvasBuilder;
 use crate::surface::SurfaceRef;
@@ -1110,6 +1110,7 @@ pub struct WindowBuilder {
     y: WindowPos,
     window_flags: u32,
     create_metal_view: bool,
+    is_shaped: bool,
     /// The window builder cannot be built on a non-main thread, so prevent cross-threaded moves and references.
     /// `!Send` and `!Sync`,
     subsystem: VideoSubsystem,
@@ -1127,6 +1128,7 @@ impl WindowBuilder {
             window_flags: 0,
             subsystem: v.clone(),
             create_metal_view: false,
+            is_shaped: false
         }
     }
 
@@ -1148,14 +1150,25 @@ impl WindowBuilder {
         let raw_width = self.width as c_int;
         let raw_height = self.height as c_int;
         unsafe {
-            let raw = sys::SDL_CreateWindow(
-                title.as_ptr() as *const c_char,
-                to_ll_windowpos(self.x),
-                to_ll_windowpos(self.y),
-                raw_width,
-                raw_height,
-                self.window_flags,
-            );
+            let raw = if self.is_shaped {
+                sys::SDL_CreateShapedWindow(
+                    title.as_ptr() as *const c_char,
+                    to_ll_windowpos(self.x) as c_uint,
+                    to_ll_windowpos(self.y) as c_uint,
+                    raw_width as c_uint,
+                    raw_height as c_uint,
+                    self.window_flags,
+                )
+            } else {
+                sys::SDL_CreateWindow(
+                    title.as_ptr() as *const c_char,
+                    to_ll_windowpos(self.x),
+                    to_ll_windowpos(self.y),
+                    raw_width,
+                    raw_height,
+                    self.window_flags,
+                )
+            };
             let mut metal_view = 0 as sys::SDL_MetalView;
             #[cfg(target_os = "macos")]
             if self.create_metal_view {
@@ -1267,6 +1280,15 @@ impl WindowBuilder {
     /// Has no effect no other platforms.
     pub fn metal_view(&mut self) -> &mut WindowBuilder {
         self.create_metal_view = true;
+        self
+    }
+
+    /// Enables the window to be shaped (see [`Window::set_shape`]).
+    /// This also implies [`WindowBuilder::borderless`].
+    pub fn shaped(&mut self) -> &mut WindowBuilder {
+        self.borderless();
+
+        self.is_shaped = true;
         self
     }
 }
@@ -1954,6 +1976,40 @@ impl Window {
             Err(get_error())
         }
     }
+
+
+    #[doc(alias = "SDL_SetWindowShape")]
+    pub fn set_shape(&mut self, shape: &SurfaceRef, shape_mode: WindowShapeMode) -> Result<(), WindowSetShapeError> {
+        let (mode, parameters) = match shape_mode {
+            WindowShapeMode::Default => (sys::WindowShapeMode::ShapeModeDefault, sys::SDL_WindowShapeParams {
+                binarizationCutoff: 0 // dummy
+            }),
+            WindowShapeMode::BinarizeAlpha(cutoff) => (sys::WindowShapeMode::ShapeModeBinarizeAlpha, sys::SDL_WindowShapeParams {
+                binarizationCutoff: cutoff
+            }),
+            WindowShapeMode::ReverseBinarizeAlpha(cutoff) => (sys::WindowShapeMode::ShapeModeReverseBinarizeAlpha, sys::SDL_WindowShapeParams {
+                binarizationCutoff: cutoff
+            }),
+            WindowShapeMode::ColorKey(key) => (sys::WindowShapeMode::ShapeModeColorKey, sys::SDL_WindowShapeParams {
+                colorKey: key.into()
+            })
+        };
+
+        let mut window_shape_mode = sys::SDL_WindowShapeMode {
+            mode,
+            parameters
+        };
+        let window_shape_mode_raw = &mut window_shape_mode as *mut sys::SDL_WindowShapeMode;
+
+        let result = unsafe { sys::SDL_SetWindowShape(self.context.raw, shape.raw(), window_shape_mode_raw) };
+        match result {
+            0 => Ok(()),
+            sys::SDL_NONSHAPEABLE_WINDOW => Err(WindowSetShapeError::NonShapeableWindow),
+            sys::SDL_INVALID_SHAPE_ARGUMENT => Err(WindowSetShapeError::InvalidShapeArgument),
+            sys::SDL_WINDOW_LACKS_SHAPE => Err(WindowSetShapeError::WindowLacksShape),
+            _ => Err(WindowSetShapeError::Unknown)
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -2004,4 +2060,40 @@ pub fn drivers() -> DriverIterator {
         length: unsafe { sys::SDL_GetNumVideoDrivers() },
         index: 0,
     }
+}
+
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum WindowSetShapeError {
+    Unknown,
+    NonShapeableWindow,
+    InvalidShapeArgument,
+    WindowLacksShape
+}
+
+impl fmt::Display for WindowSetShapeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let error = match self {
+            WindowSetShapeError::NonShapeableWindow => "non-shapeable window",
+            WindowSetShapeError::InvalidShapeArgument => "invalid shape argumemt",
+            WindowSetShapeError::WindowLacksShape => "window lacks shape",
+            _ => "unknown error",
+        };
+
+        write!(f, "{}", error)
+    }
+}
+
+impl Error for WindowSetShapeError {}
+
+/// The parameters to set for the shaped window.
+pub enum WindowShapeMode {
+    /// The default mode, a binarized alpha cutoff of 1.
+    Default,
+    /// A binarized alpha cutoff with a given integer value.
+    BinarizeAlpha(u8),
+    /// A binarized alpha cutoff with a given integer value, but with the opposite comparison.
+    ReverseBinarizeAlpha(u8),
+    /// A color key is applied.
+    ColorKey(Color)
 }
